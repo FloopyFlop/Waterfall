@@ -47,6 +47,17 @@ source install/setup.bash
   ```bash
   ros2 run waterfall waterfall_node --services orchestra --orchestra-connection udp://:14540
   ```
+- Coordinator demo (launch Firehose + Pump + Inject, watch Firehose data, trigger Inject when a threshold is crossed):
+  ```bash
+  ros2 run waterfall waterfall_coordinator \
+    --services firehose uniform_pump inject \
+    --connection serial:/dev/ttyTHS3:115200 --serial-baud 115200 \
+    --px4-build-path /path/to/PX4-Autopilot/build/px4_sitl_default \
+    --trigger-msg-type SCALED_IMU --trigger-field xacc --trigger-threshold 5.0 \
+    --inject-set MC_ROLL_P=-7.0 MC_PITCH_P=-7.0 \
+    --inject-file ROMFS/px4fmu_common/init.d/rc.autostart
+  ```
+  Add `--fly-circle` to also run a simple circle mission via the vendored DroneAPI (MAVSDK).
 
 ## Key flags
 - `--sitl` switches all MAVLink/MAVSDK clients to the configured SITL endpoints (`--sitl-connection` for Firehose/Inject, `--orchestra-sitl` for Orchestra).

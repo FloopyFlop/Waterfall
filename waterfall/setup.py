@@ -38,6 +38,7 @@ setup(
             'uniform_pump_service = waterfall.uniform_pump_service:main',
             'inject_service = waterfall.inject_service:main',
             'orchestra_service = waterfall.orchestra_service:main',
+            'waterfall_coordinator = waterfall.coordinator:main',
         ],
     },
 )
