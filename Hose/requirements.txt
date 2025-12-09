@@ -1,0 +1,7 @@
+pymavlink>=2.4.40
+rich>=13.0.0
+rclpy
+std_msgs
+sensor_msgs
+geometry_msgs
+nav_msgs
