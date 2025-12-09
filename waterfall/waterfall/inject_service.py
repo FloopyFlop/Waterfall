@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import String
-import os
+import argparse
 import sys
+import os
 import json
 import time
 from pathlib import Path
+
+import rclpy
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from std_msgs.msg import String
 
 try:
     from pymavlink import mavutil
@@ -16,7 +19,7 @@ except ImportError:
     MAVLINK_AVAILABLE = False
 
 try:
-    from mav_inject.px4_param_api import PX4ParamAPI, PX4ParamType
+    from waterfall.px4_param_api import PX4ParamAPI, PX4ParamType
     PX4_C_API_AVAILABLE = True
 except Exception as e:
     print(f"Warning: PX4 C API not available: {e}")
@@ -24,12 +27,24 @@ except Exception as e:
 
 
 class PX4ConfigInjector(Node):
-    def __init__(self):
+    def __init__(self, cli_args=None):
         super().__init__('px4_config_injector')
 
         # Declare and get parameters
         self.declare_parameter('px4_build_path', '')
+        self.declare_parameter('use_sitl', True)
+        self.declare_parameter('sitl_connection', 'udp:127.0.0.1:14550')
+        self.declare_parameter('serial_port', '/dev/ttyTHS3')
+        self.declare_parameter('serial_baud', 115200)
+        # Leave empty by default so the SITL/hardware selection can take effect unless explicitly set
+        self.declare_parameter('mavlink_connection', '')
+
+        self._apply_cli_overrides(cli_args)
+
         self.px4_build_path = self.get_parameter('px4_build_path').get_parameter_value().string_value
+        self.use_sitl = bool(self.get_parameter('use_sitl').get_parameter_value().bool_value)
+        self.serial_port = self.get_parameter('serial_port').get_parameter_value().string_value
+        self.serial_baud = int(self.get_parameter('serial_baud').get_parameter_value().integer_value)
 
         if not self.px4_build_path:
             self.get_logger().error('PX4 build path not provided! Use --ros-args -p px4_build_path:=/path/to/px4')
@@ -57,15 +72,17 @@ class PX4ConfigInjector(Node):
             self.get_logger().warning('PX4 C API not available. Will use MAVLink fallback.')
 
         # MAVLink connection as fallback
-        self.declare_parameter('mavlink_connection', 'udp:127.0.0.1:14550')
-        self.mavlink_conn_string = self.get_parameter('mavlink_connection').get_parameter_value().string_value
+        self.mavlink_conn_string = self._resolve_mavlink_connection()
         self.mav = None
 
         # Only try MAVLink if C API is not available
         if self.px4_api is None and MAVLINK_AVAILABLE:
             try:
                 self.get_logger().info(f'Connecting to MAVLink at {self.mavlink_conn_string}')
-                self.mav = mavutil.mavlink_connection(self.mavlink_conn_string)
+                conn_kwargs = {}
+                if not self.use_sitl and self.serial_baud:
+                    conn_kwargs['baud'] = self.serial_baud
+                self.mav = mavutil.mavlink_connection(self.mavlink_conn_string, **conn_kwargs)
                 self.get_logger().info('Waiting for MAVLink heartbeat...')
                 self.mav.wait_heartbeat(timeout=5)
                 self.get_logger().info(f'MAVLink connected! System {self.mav.target_system} Component {self.mav.target_component}')
@@ -97,6 +114,41 @@ class PX4ConfigInjector(Node):
         # Run automated tests after a short delay
         self.get_logger().info('Scheduling automated parameter tests to run in 2 seconds...')
         self.test_timer = self.create_timer(2.0, self.run_automated_tests)
+
+    def _apply_cli_overrides(self, cli_args):
+        """Allow simple --sitl/--connection flag usage without long ROS args."""
+        if cli_args is None:
+            return
+
+        updates = []
+        if getattr(cli_args, 'px4_build_path', None):
+            updates.append(Parameter('px4_build_path', Parameter.Type.STRING, cli_args.px4_build_path))
+        if getattr(cli_args, 'sitl', None) is True:
+            updates.append(Parameter('use_sitl', Parameter.Type.BOOL, True))
+        if getattr(cli_args, 'sitl_connection', None):
+            updates.append(Parameter('sitl_connection', Parameter.Type.STRING, cli_args.sitl_connection))
+        if getattr(cli_args, 'serial_port', None):
+            updates.append(Parameter('serial_port', Parameter.Type.STRING, cli_args.serial_port))
+        if getattr(cli_args, 'serial_baud', None):
+            updates.append(Parameter('serial_baud', Parameter.Type.INTEGER, cli_args.serial_baud))
+        if getattr(cli_args, 'connection', None):
+            updates.append(Parameter('mavlink_connection', Parameter.Type.STRING, cli_args.connection))
+
+        if updates:
+            self.set_parameters(updates)
+
+    def _resolve_mavlink_connection(self):
+        explicit = self.get_parameter('mavlink_connection').get_parameter_value().string_value
+        sitl_conn = self.get_parameter('sitl_connection').get_parameter_value().string_value
+
+        if explicit:
+            return explicit
+
+        if self.use_sitl:
+            return sitl_conn
+
+        # Hardware path – let mavutil use the baud declared via parameter
+        return self.serial_port
 
     def identify_config_files(self):
         """Identify common PX4 configuration file locations"""
@@ -594,7 +646,7 @@ class PX4ConfigInjector(Node):
 
         self.get_logger().info('Configuration restored')
 
-    def periodic_check(self):
+def periodic_check(self):
         """Periodic health check"""
         status_msg = String()
         status_msg.data = json.dumps({
@@ -605,11 +657,26 @@ class PX4ConfigInjector(Node):
         self.status_pub.publish(status_msg)
 
 
+def _parse_cli_args(argv):
+    parser = argparse.ArgumentParser(
+        add_help=False,
+        description='PX4 configuration injector convenience flags.'
+    )
+    parser.add_argument('--px4-build-path', dest='px4_build_path', help='PX4 build directory containing firmware artifacts.')
+    parser.add_argument('--sitl', action='store_true', help='Use SITL UDP connection instead of hardware serial.')
+    parser.add_argument('--connection', help='Explicit MAVLink connection string (overrides sitl/serial resolution).')
+    parser.add_argument('--sitl-connection', dest='sitl_connection', help='SITL MAVLink connection string override.')
+    parser.add_argument('--serial-port', dest='serial_port', help='Serial port for hardware connection.')
+    parser.add_argument('--serial-baud', dest='serial_baud', type=int, help='Serial baud rate for hardware connection.')
+    return parser.parse_known_args(argv)
+
+
 def main(args=None):
-    rclpy.init(args=args)
+    cli_args, ros_args = _parse_cli_args(sys.argv[1:] if args is None else args)
+    rclpy.init(args=ros_args)
 
     try:
-        node = PX4ConfigInjector()
+        node = PX4ConfigInjector(cli_args=cli_args)
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass

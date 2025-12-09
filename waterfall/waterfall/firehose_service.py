@@ -5,8 +5,12 @@ Connects to PX4 via pymavlink and publishes ALL raw messages at maximum rate
 WITH LIVE TERMINAL DASHBOARD
 """
 
+import argparse
+import sys
+
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from std_msgs.msg import String, Float64MultiArray, UInt8MultiArray, Header
 from sensor_msgs.msg import Imu, MagneticField, FluidPressure, NavSatFix, BatteryState
 from geometry_msgs.msg import TwistStamped, PoseStamped, Vector3Stamped
@@ -37,7 +41,7 @@ class MavFirehoseNode(Node):
     WITH LIVE TERMINAL DASHBOARD
     """
 
-    def __init__(self):
+    def __init__(self, cli_overrides=None):
         super().__init__('mav_firehose_node')
 
         # Parameters
@@ -49,6 +53,9 @@ class MavFirehoseNode(Node):
         self.declare_parameter('sitl_address', 'udp:127.0.0.1:14550')  # SITL default
         self.declare_parameter('data_stream_rate', 100)  # Request 100Hz for everything
         self.declare_parameter('publish_raw_bytes', True)  # Publish raw MAVLink bytes
+
+        # Apply CLI overrides before reading values so flags like --sitl take effect
+        self._apply_cli_overrides(cli_overrides)
 
         use_sitl = self.get_parameter('use_sitl').value
 
@@ -66,6 +73,9 @@ class MavFirehoseNode(Node):
             self.serial_port = self.get_parameter('serial_port').value
             self.serial_baud = self.get_parameter('serial_baud').value
             self.connection_string = self.serial_port
+
+        # Normalize serial-style connection strings (e.g., serial:/dev/ttyUSB0:921600)
+        self.connection_string = self._normalize_connection_string(self.connection_string)
 
         self.stream_rate = self.get_parameter('data_stream_rate').value
         self.publish_raw = self.get_parameter('publish_raw_bytes').value
@@ -131,6 +141,61 @@ class MavFirehoseNode(Node):
 
         # Dashboard will be started by main()
         self.dashboard_active = False
+
+    def _apply_cli_overrides(self, overrides):
+        """Apply CLI flags (e.g., --sitl, --connection) to parameters before reading them."""
+        if overrides is None:
+            return
+
+        updates = []
+        if getattr(overrides, 'sitl', False):
+            updates.append(Parameter('use_sitl', Parameter.Type.BOOL, True))
+        if getattr(overrides, 'connection_string', None):
+            updates.append(Parameter('connection_string', Parameter.Type.STRING, overrides.connection_string))
+        if getattr(overrides, 'serial_port', None):
+            updates.append(Parameter('serial_port', Parameter.Type.STRING, overrides.serial_port))
+        if getattr(overrides, 'serial_baud', None):
+            updates.append(Parameter('serial_baud', Parameter.Type.INTEGER, overrides.serial_baud))
+        if getattr(overrides, 'data_stream_rate', None):
+            updates.append(Parameter('data_stream_rate', Parameter.Type.INTEGER, overrides.data_stream_rate))
+        if getattr(overrides, 'disable_raw_bytes', False):
+            updates.append(Parameter('publish_raw_bytes', Parameter.Type.BOOL, False))
+
+        if updates:
+            self.set_parameters(updates)
+
+    def _normalize_connection_string(self, conn: str) -> str:
+        """
+        Allow friendly serial:* style or path:baud inputs and convert to pymavlink expected form.
+        - serial:/dev/ttyUSB0:921600 -> /dev/ttyUSB0 (baud set)
+        - serial:///dev/ttyTHS3 -> /dev/ttyTHS3
+        - /dev/ttyUSB0:921600 -> /dev/ttyUSB0 (baud set)
+        """
+        if not conn:
+            return conn
+
+        raw = conn
+        if raw.startswith('serial://'):
+            raw = raw[len('serial://'):]
+        elif raw.startswith('serial:'):
+            raw = raw[len('serial:'):]
+
+        # If there's a baud component at the end, capture it
+        if ':' in raw:
+            path, maybe_baud = raw.rsplit(':', 1)
+            if maybe_baud.isdigit():
+                try:
+                    self.serial_baud = int(maybe_baud)
+                except Exception:
+                    pass
+                raw = path
+
+        # Update serial port if this looks like a path
+        if raw.startswith('/dev/'):
+            self.serial_port = raw
+            return raw
+
+        return conn
 
     def process_keys(self):
         """Process any queued key presses"""
@@ -895,10 +960,22 @@ def key_listener(node, should_exit):
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-def main(args=None):
-    rclpy.init(args=args)
+def _parse_cli_args(argv):
+    parser = argparse.ArgumentParser(add_help=False, description="MAV FIRE HOSE connection helpers")
+    parser.add_argument('--sitl', action='store_true', help='Force SITL connection (overrides serial defaults).')
+    parser.add_argument('--connection', dest='connection_string', help='Override MAVLink connection string (udp/tcp/serial).')
+    parser.add_argument('--serial-port', dest='serial_port', help='Serial port path for hardware connection.')
+    parser.add_argument('--serial-baud', dest='serial_baud', type=int, help='Serial baud rate for hardware connection.')
+    parser.add_argument('--stream-rate', dest='data_stream_rate', type=int, help='Data stream request rate (Hz).')
+    parser.add_argument('--no-raw-bytes', dest='disable_raw_bytes', action='store_true', help='Disable raw byte publishing.')
+    return parser.parse_known_args(argv)
 
-    node = MavFirehoseNode()
+
+def main(args=None):
+    cli_args, ros_args = _parse_cli_args(sys.argv[1:] if args is None else args)
+    rclpy.init(args=ros_args)
+
+    node = MavFirehoseNode(cli_overrides=cli_args)
 
     console = Console()
 

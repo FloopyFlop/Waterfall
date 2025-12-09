@@ -1,6 +1,9 @@
 # test_demo.py
+import argparse
 import asyncio
 import json
+import os
+import sys
 import numpy as np
 from typing import List, Tuple
 
@@ -131,7 +134,7 @@ STREAM_QOS_DEPTH = 10
 
 # ---------- test runner ----------
 
-async def _async_main():
+async def _async_main(system_address: str):
     initial_altitude = 3.0
 
     scenarios = [
@@ -163,7 +166,7 @@ async def _async_main():
             ros_kwargs["ros2_publisher_factory"] = console_factory
 
     drone = DroneAPI(
-        system_address="udp://:14540",
+        system_address=system_address,
         default_interpolation=Linear,
         control_rate_hz=20.0,  # Increased from 10 to handle faster telemetry
         max_speed_m_s=1.5,
@@ -234,7 +237,37 @@ def main() -> None:
     ros2 entry points expect a synchronous callable.
     Wrap the async mission execution in asyncio.run so ros2 run drone_api service works.
     """
-    asyncio.run(_async_main())
+    cli_args = _parse_cli_args(sys.argv[1:])
+    system_address = _resolve_system_address(cli_args)
+    print(f"[magpie] Connecting via {system_address}")
+    asyncio.run(_async_main(system_address))
+
+
+def _parse_cli_args(argv):
+    parser = argparse.ArgumentParser(description="MAGPIE waypoint demo")
+    parser.add_argument('--system-address', dest='system_address', help='MAVSDK connection string (e.g., udp://:14540, serial:///dev/ttyACM0:57600)')
+    parser.add_argument('--sitl', dest='sitl', action='store_true', help='Force SITL connection (udp://:14540 by default).')
+    parser.add_argument('--no-sitl', dest='sitl', action='store_false', help='Force hardware connection.')
+    parser.add_argument('--sitl-address', dest='sitl_address', default=os.getenv('MAGPIE_SITL_ADDRESS', 'udp://:14540'),
+                        help='Override SITL MAVSDK address.')
+    parser.add_argument('--hardware-connection', dest='hardware_connection',
+                        default=os.getenv('MAGPIE_HW_CONNECTION', 'serial:///dev/ttyACM0:57600'),
+                        help='Default hardware connection when not using SITL.')
+    parser.set_defaults(sitl=None)
+    return parser.parse_args(argv)
+
+
+def _resolve_system_address(args):
+    env_addr = os.getenv('MAGPIE_SYSTEM_ADDRESS')
+    if args.system_address:
+        return args.system_address
+    if env_addr:
+        return env_addr
+    if args.sitl is None:
+        return args.sitl_address
+    if args.sitl:
+        return args.sitl_address
+    return args.hardware_connection
 
 
 if __name__ == "__main__":

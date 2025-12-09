@@ -1,10 +1,10 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>mav_data_hose</name>
-  <version>0.0.1</version>
-  <description>MAV FIRE HOSE - High-frequency raw MAVLink data streaming to ROS2</description>
-  <maintainer email="your_email@example.com">Your Name</maintainer>
+  <name>waterfall</name>
+  <version>0.1.0</version>
+  <description>Wrapper ROS2 node that starts Orchestra, Firehose, UniformPump, and Inject under one manager.</description>
+  <maintainer email="dev@todo.todo">waterfall</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
@@ -14,6 +14,11 @@
   <depend>nav_msgs</depend>
 
   <exec_depend>python3-pymavlink</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-rich</exec_depend>
+  <exec_depend>python3-mavsdk</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
