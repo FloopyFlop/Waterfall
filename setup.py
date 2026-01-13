@@ -39,6 +39,7 @@ setup(
             'inject_service = waterfall.inject_service:main',
             'orchestra_service = waterfall.orchestra_service:main',
             'waterfall_coordinator = waterfall.coordinator:main',
+            'waterfall_fault_demo = waterfall.fault_monitor_demo:main',
         ],
     },
 )

@@ -58,6 +58,11 @@ source install/setup.bash
     --inject-file ROMFS/px4fmu_common/init.d/rc.autostart
   ```
   Add `--fly-circle` to also run a simple circle mission via the vendored DroneAPI (MAVSDK).
+- Fault monitor demo (matches the “throttle up, classify, wait for disarm, then Inject” flow):
+  ```bash
+  ros2 run waterfall waterfall_fault_demo
+  ```
+  Configuration is declarative inside `waterfall/fault_monitor_demo.py` (edit the `CONFIG` block and/or `example_model`).
 
 ## Key flags
 - `--sitl` switches all MAVLink/MAVSDK clients to the configured SITL endpoints (`--sitl-connection` for Firehose/Inject, `--orchestra-sitl` for Orchestra).
