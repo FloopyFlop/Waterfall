@@ -5,6 +5,9 @@ Subscribes to MAV FIRE HOSE data and packages it into uniform time intervals
 WITH LIVE TERMINAL DASHBOARD
 """
 
+import argparse
+import sys
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -854,25 +857,37 @@ def key_listener(node, should_exit):
 
 
 def main(args=None):
-    rclpy.init(args=args)
+    parser = argparse.ArgumentParser(add_help=False, description="Uniform pump helpers")
+    parser.add_argument('--headless', action='store_true', help='Disable the dashboard UI (ROS node only).')
+    cli_args, ros_args = parser.parse_known_args(args)
+
+    rclpy.init(args=ros_args)
 
     node = UniformPumpNode()
 
-    console = Console()
-
-    # Start ROS2 spinning in a separate thread
-    spin_thread = threading.Thread(target=lambda: rclpy.spin(node), daemon=True)
-    spin_thread.start()
-
-    # Start key listener in a separate thread
-    should_exit = threading.Event()
-    key_thread = threading.Thread(target=key_listener, args=(node, should_exit), daemon=True)
-    key_thread.start()
-
-    node.dashboard_active = True
-    node._add_log('Dashboard started! Keys: ← → (pages)  + - (items)  q (quit)', 'SUCCESS', 'bold green')
-
     try:
+        headless = bool(getattr(cli_args, 'headless', False))
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            headless = True
+
+        if headless:
+            rclpy.spin(node)
+            return
+
+        console = Console()
+
+        # Start ROS2 spinning in a separate thread
+        spin_thread = threading.Thread(target=lambda: rclpy.spin(node), daemon=True)
+        spin_thread.start()
+
+        # Start key listener in a separate thread
+        should_exit = threading.Event()
+        key_thread = threading.Thread(target=key_listener, args=(node, should_exit), daemon=True)
+        key_thread.start()
+
+        node.dashboard_active = True
+        node._add_log('Dashboard started! Keys: ← → (pages)  + - (items)  q (quit)', 'SUCCESS', 'bold green')
+
         # Run the live dashboard
         with Live(node.generate_dashboard(), refresh_per_second=10, console=console, screen=True) as live:
             while rclpy.ok() and not should_exit.is_set():
@@ -881,7 +896,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        should_exit.set()
+        if 'should_exit' in locals():
+            should_exit.set()
         node.dashboard_active = False
         node.destroy_node()
         rclpy.shutdown()

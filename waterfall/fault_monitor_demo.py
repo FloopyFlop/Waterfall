@@ -14,6 +14,7 @@ parameter edits. The main() function shows the high-level flow:
 import importlib
 import importlib.util
 import json
+import os
 import shlex
 import signal
 import subprocess
@@ -40,6 +41,7 @@ class ServiceConfig:
     sitl_connection: str = 'udp:127.0.0.1:14550'
     serial_port: str = '/dev/ttyTHS3'
     serial_baud: int = 115200
+    headless_services: bool = True
     px4_build_path: str = '/path/to/PX4-Autopilot/build/px4_sitl_default'
     firehose_args: str = ''
     inject_args: str = ''
@@ -298,7 +300,7 @@ def start_services(config: ServiceConfig) -> Dict[str, subprocess.Popen]:
         if not cmd:
             continue
         try:
-            proc = subprocess.Popen(cmd)
+            proc = subprocess.Popen(cmd, start_new_session=True)
             processes[svc] = proc
             print(f'[fault_demo] started {svc}: {" ".join(cmd)}')
         except Exception as exc:
@@ -310,10 +312,15 @@ def stop_services(processes: Dict[str, subprocess.Popen]):
     for svc, proc in list(processes.items()):
         if proc.poll() is None:
             try:
-                proc.send_signal(signal.SIGINT)
+                os.killpg(proc.pid, signal.SIGINT)
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            except ProcessLookupError:
+                pass
         print(f'[fault_demo] stopped {svc} (rc={proc.poll()})')
         processes.pop(svc, None)
 
@@ -328,6 +335,8 @@ def build_service_cmd(svc: str, config: ServiceConfig) -> Optional[List[str]]:
         ]
         if config.use_sitl:
             cmd.append('--sitl')
+        if config.headless_services:
+            cmd.append('--headless')
         if config.firehose_args:
             cmd.extend(shlex.split(config.firehose_args))
         return cmd

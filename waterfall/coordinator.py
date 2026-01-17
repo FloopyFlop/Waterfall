@@ -6,6 +6,7 @@ command over ROS when a threshold is crossed.
 """
 
 import argparse
+import os
 import json
 import shlex
 import signal
@@ -69,7 +70,7 @@ class WaterfallCoordinator(Node):
             if not cmd:
                 continue
             try:
-                proc = subprocess.Popen(cmd)
+                proc = subprocess.Popen(cmd, start_new_session=True)
                 self.processes[svc] = proc
                 self.get_logger().info(f"Started {svc}: {' '.join(cmd)}")
             except Exception as exc:
@@ -79,10 +80,15 @@ class WaterfallCoordinator(Node):
         for svc, proc in list(self.processes.items()):
             if proc.poll() is None:
                 try:
-                    proc.send_signal(signal.SIGINT)
+                    os.killpg(proc.pid, signal.SIGINT)
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                except ProcessLookupError:
+                    pass
             self.get_logger().info(f"Stopped {svc} (rc={proc.poll()})")
             self.processes.pop(svc, None)
 
@@ -97,6 +103,8 @@ class WaterfallCoordinator(Node):
             ]
             if self.args.sitl:
                 cmd.append('--sitl')
+            if self.args.headless_services:
+                cmd.append('--headless')
             if self.args.firehose_args:
                 cmd.extend(shlex.split(self.args.firehose_args))
             return cmd
@@ -110,6 +118,8 @@ class WaterfallCoordinator(Node):
                 '--bleeding-domain', str(self.args.bleeding_domain),
                 '--missing-strategy', self.args.missing_strategy,
             ]
+            if self.args.headless_services:
+                cmd.append('--headless')
             if self.args.pump_args:
                 cmd.extend(shlex.split(self.args.pump_args))
             return cmd
@@ -250,6 +260,8 @@ def _parse_args(argv):
     parser.add_argument('--missing-strategy', default='bleeding_average',
                         choices=['bleeding_average', 'bleeding_latest', 'null', 'zero'],
                         help='UniformPump missing data strategy')
+    parser.add_argument('--headless-services', action='store_true',
+                        help='Run Firehose/UniformPump without dashboards (lower CPU).')
 
     parser.add_argument('--trigger-msg-type', default='SCALED_IMU', help='Firehose msg type to watch')
     parser.add_argument('--trigger-field', default='xacc', help='Field to threshold on within the message')

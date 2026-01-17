@@ -37,6 +37,7 @@ class LaunchConfig:
     pump_args: List[str]
     inject_args: List[str]
     orchestra_args: List[str]
+    headless_services: bool
     orchestra_sitl: str
     orchestra_hardware: str
     orchestra_connection: Optional[str]
@@ -66,7 +67,7 @@ class WaterfallManager(Node):
                 continue
             cmd, env = cmd_env
             try:
-                proc = subprocess.Popen(cmd, env=env)
+                proc = subprocess.Popen(cmd, env=env, start_new_session=True)
                 self.processes[service] = proc
                 self.get_logger().info(f'Started {service}: {" ".join(cmd)}')
                 self._publish_status(service, 'started', {'pid': proc.pid})
@@ -89,6 +90,8 @@ class WaterfallManager(Node):
                 '-p', f'data_stream_rate:={self.config.firehose_rate}',
                 '-p', f'publish_raw_bytes:={"true" if self.config.publish_raw else "false"}',
             ]
+            if self.config.headless_services:
+                cmd.append('--headless')
             cmd.extend(self.config.firehose_args)
             return cmd, env
 
@@ -102,6 +105,8 @@ class WaterfallManager(Node):
                 '-p', f'bleeding_domain_duration:={self.config.bleeding_domain}',
                 '-p', f'missing_data_strategy:={self.config.missing_strategy}',
             ]
+            if self.config.headless_services:
+                cmd.append('--headless')
             cmd.extend(self.config.pump_args)
             return cmd, env
 
@@ -180,10 +185,15 @@ class WaterfallManager(Node):
         for service, proc in list(self.processes.items()):
             if proc.poll() is None:
                 try:
-                    proc.send_signal(signal.SIGINT)
+                    os.killpg(proc.pid, signal.SIGINT)
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                except ProcessLookupError:
+                    pass
             self._publish_status(service, 'stopped', {'returncode': proc.poll()})
             self.processes.pop(service, None)
 
@@ -218,6 +228,8 @@ def _parse_args(argv: List[str]) -> Tuple[argparse.Namespace, List[str]]:
     parser.add_argument('--missing-strategy', default='bleeding_average',
                         choices=['bleeding_average', 'bleeding_latest', 'null', 'zero'],
                         help='Missing data strategy for uniform pump')
+    parser.add_argument('--headless-services', action='store_true',
+                        help='Run Firehose/UniformPump without dashboards (lower CPU).')
 
     parser.add_argument('--inject-px4-path', dest='inject_px4_path', default='',
                         help='PX4 build directory required by the Inject node')
@@ -264,6 +276,7 @@ def _build_config(args: argparse.Namespace) -> LaunchConfig:
         pump_args=shlex.split(args.pump_args) if args.pump_args else [],
         inject_args=shlex.split(args.inject_args) if args.inject_args else [],
         orchestra_args=shlex.split(args.orchestra_args) if args.orchestra_args else [],
+        headless_services=bool(args.headless_services),
         orchestra_sitl=args.orchestra_sitl,
         orchestra_hardware=args.orchestra_hardware,
         orchestra_connection=args.orchestra_connection,

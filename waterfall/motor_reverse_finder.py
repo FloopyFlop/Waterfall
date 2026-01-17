@@ -45,6 +45,7 @@ class ServiceConfig:
     sitl_connection: str = 'udp:127.0.0.1:14550'
     serial_port: str = '/dev/ttyTHS3'
     serial_baud: int = 115200
+    headless_services: bool = True
     px4_build_path: str = field(default_factory=lambda: os.getenv(
         'PX4_BUILD_PATH', '/path/to/PX4-Autopilot/build/px4_sitl_default'
     ))
@@ -345,6 +346,8 @@ def build_service_cmd(svc: str, config: ServiceConfig) -> Optional[List[str]]:
         ]
         if config.use_sitl:
             cmd.append('--sitl')
+        if config.headless_services:
+            cmd.append('--headless')
         if config.firehose_args:
             cmd.extend(shlex.split(config.firehose_args))
         return cmd
@@ -371,16 +374,18 @@ def build_service_cmd(svc: str, config: ServiceConfig) -> Optional[List[str]]:
 
 def start_services(config: ServiceConfig) -> Dict[str, subprocess.Popen]:
     processes: Dict[str, subprocess.Popen] = {}
-    term_cmd = select_terminal(config) if config.launch_in_terminal else None
+    term_cmd = None
+    if config.launch_in_terminal and not config.headless_services:
+        term_cmd = select_terminal(config)
     for svc in config.services:
         cmd = build_service_cmd(svc, config)
         if not cmd:
             continue
         try:
             if term_cmd:
-                proc = subprocess.Popen(term_cmd(cmd))
+                proc = subprocess.Popen(term_cmd(cmd), start_new_session=True)
             else:
-                proc = subprocess.Popen(cmd)
+                proc = subprocess.Popen(cmd, start_new_session=True)
             processes[svc] = proc
             print(f'[motor_finder] started {svc}: {" ".join(cmd)}')
         except Exception as exc:
@@ -403,10 +408,15 @@ def stop_services(processes: Dict[str, subprocess.Popen]):
     for svc, proc in list(processes.items()):
         if proc.poll() is None:
             try:
-                proc.send_signal(signal.SIGINT)
+                os.killpg(proc.pid, signal.SIGINT)
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            except ProcessLookupError:
+                pass
         print(f'[motor_finder] stopped {svc} (rc={proc.poll()})')
         processes.pop(svc, None)
 
