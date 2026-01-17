@@ -261,7 +261,7 @@ def _parse_args(argv):
                         help='Param modifications to request via Inject (KEY=VALUE pairs)')
 
     parser.add_argument('--fly-circle', action='store_true', help='Run a circle mission using DroneAPI')
-    parser.add_argument('--system-address', default='udp://:14540',
+    parser.add_argument('--system-address', default='udpin://0.0.0.0:14540',
                         help='MAVSDK system address for circle mission')
     parser.add_argument('--circle-radius', type=float, default=2.5, help='Circle radius (m)')
     parser.add_argument('--circle-altitude', type=float, default=3.0, help='Circle altitude (m)')

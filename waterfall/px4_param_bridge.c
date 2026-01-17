@@ -34,6 +34,18 @@ static int (*_param_set)(param_t param, const void *val) = NULL;
 static int (*_param_set_no_notification)(param_t param, const void *val) = NULL;
 static int (*_param_type)(param_t param) = NULL;
 
+static void *load_symbol(const char *name, const char *alt_name) {
+    void *sym = dlsym(RTLD_DEFAULT, name);
+    if (!sym && alt_name) {
+        sym = dlsym(RTLD_DEFAULT, alt_name);
+    }
+    return sym;
+}
+
+static int have_param_functions(void) {
+    return _param_find && _param_get && _param_set && _param_type;
+}
+
 // Initialize function pointers by searching in the current process
 static void init_param_functions(void) {
     static int initialized = 0;
@@ -43,16 +55,22 @@ static void init_param_functions(void) {
 
     // Try to find the functions in the current process
     // This will work if we're loaded into PX4's process space
-    _param_find = dlsym(RTLD_DEFAULT, "param_find");
-    _param_get = dlsym(RTLD_DEFAULT, "param_get");
-    _param_set = dlsym(RTLD_DEFAULT, "param_set");
-    _param_set_no_notification = dlsym(RTLD_DEFAULT, "param_set_no_notification");
-    _param_type = dlsym(RTLD_DEFAULT, "param_type");
+    _param_find = (param_t (*)(const char *))load_symbol("param_find", "_param_find");
+    _param_get = (int (*)(param_t, void *))load_symbol("param_get", "_param_get");
+    _param_set = (int (*)(param_t, const void *))load_symbol("param_set", "_param_set");
+    _param_set_no_notification = (int (*)(param_t, const void *))load_symbol(
+        "param_set_no_notification", "_param_set_no_notification");
+    _param_type = (int (*)(param_t))load_symbol("param_type", "_param_type");
 
-    if (!_param_find || !_param_get || !_param_set || !_param_type) {
+    if (!have_param_functions()) {
         fprintf(stderr, "Warning: Could not find PX4 parameter functions in process.\n");
         fprintf(stderr, "This library must be loaded into PX4's process space.\n");
     }
+}
+
+int px4_param_bridge_ready(void) {
+    init_param_functions();
+    return have_param_functions() ? 1 : 0;
 }
 
 // Bridge functions with simple C interface for Python ctypes
@@ -91,18 +109,24 @@ int px4_param_get_float(const char *name, float *value) {
         return -1;
     }
 
-    param_t handle = param_find(name);
+    init_param_functions();
+    if (!_param_find || !_param_get || !_param_type) {
+        fprintf(stderr, "px4_param_get_float: PX4 parameter functions not available\n");
+        return -1;
+    }
+
+    param_t handle = _param_find(name);
     if (handle == 0) {
         fprintf(stderr, "px4_param_get_float: Parameter '%s' not found\n", name);
         return -1;
     }
 
-    if (param_type(handle) != PARAM_TYPE_FLOAT) {
+    if (_param_type(handle) != PARAM_TYPE_FLOAT) {
         fprintf(stderr, "px4_param_get_float: Parameter '%s' is not FLOAT type\n", name);
         return -1;
     }
 
-    int ret = param_get(handle, value);
+    int ret = _param_get(handle, value);
     if (ret != 0) {
         fprintf(stderr, "px4_param_get_float: Failed to get value for '%s' (error %d)\n", name, ret);
         return -1;
@@ -122,20 +146,26 @@ int px4_param_set_float(const char *name, float value) {
         return -1;
     }
 
-    param_t handle = param_find(name);
+    init_param_functions();
+    if (!_param_find || !_param_set || !_param_type) {
+        fprintf(stderr, "px4_param_set_float: PX4 parameter functions not available\n");
+        return -1;
+    }
+
+    param_t handle = _param_find(name);
     if (handle == 0) {
         fprintf(stderr, "px4_param_set_float: Parameter '%s' not found\n", name);
         return -1;
     }
 
-    if (param_type(handle) != PARAM_TYPE_FLOAT) {
+    if (_param_type(handle) != PARAM_TYPE_FLOAT) {
         fprintf(stderr, "px4_param_set_float: Parameter '%s' is not FLOAT type\n", name);
         return -1;
     }
 
     printf("px4_param_set_float: Setting %s = %f\n", name, value);
 
-    int ret = param_set(handle, &value);
+    int ret = _param_set(handle, &value);
     if (ret != 0) {
         fprintf(stderr, "px4_param_set_float: Failed to set value for '%s' (error %d)\n", name, ret);
         return -1;
@@ -155,18 +185,24 @@ int px4_param_get_int32(const char *name, int32_t *value) {
         return -1;
     }
 
-    param_t handle = param_find(name);
+    init_param_functions();
+    if (!_param_find || !_param_get || !_param_type) {
+        fprintf(stderr, "px4_param_get_int32: PX4 parameter functions not available\n");
+        return -1;
+    }
+
+    param_t handle = _param_find(name);
     if (handle == 0) {
         fprintf(stderr, "px4_param_get_int32: Parameter '%s' not found\n", name);
         return -1;
     }
 
-    if (param_type(handle) != PARAM_TYPE_INT32) {
+    if (_param_type(handle) != PARAM_TYPE_INT32) {
         fprintf(stderr, "px4_param_get_int32: Parameter '%s' is not INT32 type\n", name);
         return -1;
     }
 
-    int ret = param_get(handle, value);
+    int ret = _param_get(handle, value);
     if (ret != 0) {
         fprintf(stderr, "px4_param_get_int32: Failed to get value for '%s' (error %d)\n", name, ret);
         return -1;
@@ -186,20 +222,26 @@ int px4_param_set_int32(const char *name, int32_t value) {
         return -1;
     }
 
-    param_t handle = param_find(name);
+    init_param_functions();
+    if (!_param_find || !_param_set || !_param_type) {
+        fprintf(stderr, "px4_param_set_int32: PX4 parameter functions not available\n");
+        return -1;
+    }
+
+    param_t handle = _param_find(name);
     if (handle == 0) {
         fprintf(stderr, "px4_param_set_int32: Parameter '%s' not found\n", name);
         return -1;
     }
 
-    if (param_type(handle) != PARAM_TYPE_INT32) {
+    if (_param_type(handle) != PARAM_TYPE_INT32) {
         fprintf(stderr, "px4_param_set_int32: Parameter '%s' is not INT32 type\n", name);
         return -1;
     }
 
     printf("px4_param_set_int32: Setting %s = %d\n", name, value);
 
-    int ret = param_set(handle, &value);
+    int ret = _param_set(handle, &value);
     if (ret != 0) {
         fprintf(stderr, "px4_param_set_int32: Failed to set value for '%s' (error %d)\n", name, ret);
         return -1;
@@ -219,13 +261,19 @@ int px4_param_get_type(const char *name) {
         return -1;
     }
 
-    param_t handle = param_find(name);
+    init_param_functions();
+    if (!_param_find || !_param_type) {
+        fprintf(stderr, "px4_param_get_type: PX4 parameter functions not available\n");
+        return -1;
+    }
+
+    param_t handle = _param_find(name);
     if (handle == 0) {
         fprintf(stderr, "px4_param_get_type: Parameter '%s' not found\n", name);
         return -1;
     }
 
-    param_type_t type = param_type(handle);
+    param_type_t type = _param_type(handle);
     printf("px4_param_get_type: %s is type %d\n", name, (int)type);
     return (int)type;
 }

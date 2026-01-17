@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
 """
-Fault monitor demo (no CLI flags).
+Motor reverse finder (no CLI flags).
 
-Edit the configuration blocks below to match your hardware, model, and
-parameter edits. The main() function shows the high-level flow:
-  1) start services
-  2) monitor telemetry while throttle is up
-  3) classify and detect fault
-  4) wait for disarm
-  5) inject config edit
+Goal: automatically discover which parameter flips a motor direction by:
+  1) starting Firehose + Inject
+  2) iterating candidate params
+  3) running a short flight/telemetry window
+  4) asking the model if a fault is present
+  5) persisting the winning param via Inject
+
+Edit the CONFIG block below to fit your setup.
 """
 
+import asyncio
 import importlib
 import importlib.util
 import json
+import os
 import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
+import shutil
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
@@ -40,15 +45,26 @@ class ServiceConfig:
     sitl_connection: str = 'udp:127.0.0.1:14550'
     serial_port: str = '/dev/ttyTHS3'
     serial_baud: int = 115200
-    px4_build_path: str = '/path/to/PX4-Autopilot/build/px4_sitl_default'
+    px4_build_path: str = field(default_factory=lambda: os.getenv(
+        'PX4_BUILD_PATH', '/path/to/PX4-Autopilot/build/px4_sitl_default'
+    ))
     firehose_args: str = ''
     inject_args: str = ''
+    launch_in_terminal: bool = True
+    terminal_cmds: List[str] = field(default_factory=lambda: [
+        'gnome-terminal',
+        'x-terminal-emulator',
+        'konsole',
+        'xfce4-terminal',
+        'lxterminal',
+    ])
 
 
 @dataclass
 class TelemetryConfig:
     topic: str = 'mav/all_messages'
     include_types: List[str] = field(default_factory=list)
+    gate_on_throttle: bool = False
     throttle_msg_type: str = 'RC_CHANNELS'
     throttle_field: str = 'chan3_raw'
     throttle_threshold: float = 1200.0
@@ -67,48 +83,70 @@ class ModelConfig:
     fault_label: str = 'fault'
     ok_label: str = 'ok'
     fault_score_threshold: float = 0.5
+    required_fault_votes: int = 1
+    min_votes: int = 1
+
+
+@dataclass
+class SearchConfig:
+    bitmask_params: List[str] = field(default_factory=lambda: ['PWM_MAIN_REV', 'PWM_AUX_REV'])
+    motor_count: int = 4
+    baseline: Dict[str, float] = field(default_factory=lambda: {'PWM_MAIN_REV': 0})
+    explicit_candidates: Dict[str, List[float]] = field(default_factory=dict)
+    settle_sec: float = 1.0
+
+
+@dataclass
+class TestConfig:
+    duration_sec: float = 6.0
+    baseline_duration_sec: float = 4.0
+    baseline_required_ok: bool = True
+
+
+@dataclass
+class FlightConfig:
+    enabled: bool = True
+    system_address: str = 'udpin://0.0.0.0:14540'
+    takeoff_altitude: float = 0.5
+    hold_sec: float = 2.0
+    land_wait_sec: float = 3.0
 
 
 @dataclass
 class InjectConfig:
     file: str = 'ROMFS/px4fmu_common/init.d/rc.autostart'
-    modifications: Dict[str, float] = field(default_factory=lambda: {
-        'MC_ROLL_P': -7.0,
-        'MC_PITCH_P': -7.0,
-    })
 
 
 @dataclass
-class TimeoutConfig:
-    disarm_timeout_sec: float = 0.0  # 0 means wait forever
-
-
-@dataclass
-class DemoConfig:
+class FinderConfig:
     services: ServiceConfig = field(default_factory=ServiceConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
+    test: TestConfig = field(default_factory=TestConfig)
+    flight: FlightConfig = field(default_factory=FlightConfig)
     inject: InjectConfig = field(default_factory=InjectConfig)
-    timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
 
 
 def example_model(snapshot: Dict[str, Any]) -> str:
-    """Replace this with your model; return 'fault' or 'ok'."""
+    """Replace with your model. Return 'fault' or 'ok'."""
     return 'ok'
 
 
-CONFIG = DemoConfig(
+CONFIG = FinderConfig(
     services=ServiceConfig(),
     telemetry=TelemetryConfig(),
     model=ModelConfig(callable=example_model),
+    search=SearchConfig(),
+    test=TestConfig(),
+    flight=FlightConfig(),
     inject=InjectConfig(),
-    timeouts=TimeoutConfig(),
 )
 
 
-class FaultMonitorNode(Node):
-    def __init__(self, config: DemoConfig, model: Callable[[Dict[str, Any]], Any]):
-        super().__init__('waterfall_fault_monitor')
+class FinderNode(Node):
+    def __init__(self, config: FinderConfig, model: Callable[[Dict[str, Any]], Any]):
+        super().__init__('waterfall_motor_reverse_finder')
         self.config = config
         self.model = model
 
@@ -116,9 +154,6 @@ class FaultMonitorNode(Node):
         self.throttle_active = False
         self.last_throttle: Optional[float] = None
         self.armed: Optional[bool] = None
-        self.state = 'monitoring'
-        self.fault_detected = False
-        self.inject_sent = False
         self.last_classify = 0.0
 
         self.telemetry_include = self._parse_type_set(config.telemetry.include_types)
@@ -131,7 +166,6 @@ class FaultMonitorNode(Node):
             200,
         )
         self.inject_pub = self.create_publisher(String, 'px4_injector/command', 10)
-        self.status_pub = self.create_publisher(String, 'waterfall/fault_monitor/status', 10)
 
     @staticmethod
     def _parse_type_set(items: List[str]) -> Optional[Set[str]]:
@@ -139,6 +173,10 @@ class FaultMonitorNode(Node):
             return None
         cleaned = [item.strip() for item in items if item.strip()]
         return set(cleaned) if cleaned else None
+
+    def reset_trial(self):
+        self.latest_by_type.clear()
+        self.last_classify = 0.0
 
     def _telemetry_callback(self, msg: String):
         try:
@@ -160,9 +198,6 @@ class FaultMonitorNode(Node):
                 self.last_throttle = float(value)
                 self._update_throttle_state()
 
-        if self.state != 'monitoring' or not self.throttle_active:
-            return
-
         if self.telemetry_include and msg_type not in self.telemetry_include:
             return
 
@@ -176,33 +211,28 @@ class FaultMonitorNode(Node):
         if self.throttle_active:
             if self.last_throttle < (threshold - hysteresis):
                 self.throttle_active = False
-                self._publish_status('throttle_down')
         else:
             if self.last_throttle >= threshold:
                 self.throttle_active = True
-                self._publish_status('throttle_up')
 
     def should_classify(self, now: float) -> bool:
-        if self.state != 'monitoring' or not self.throttle_active:
+        if self.config.telemetry.gate_on_throttle and not self.throttle_active:
             return False
         interval = 1.0 / max(self.config.model.classify_rate_hz, 0.1)
         return (now - self.last_classify) >= interval
 
-    def classify_once(self):
+    def classify_once(self) -> Optional[bool]:
+        if not self.latest_by_type:
+            return None
         snapshot = self._build_snapshot()
         try:
             result = self.model(snapshot)
         except Exception as exc:
             self.get_logger().error(f'Model inference failed: {exc}')
-            return
+            return None
 
         self.last_classify = time.time()
-        fault = self._interpret_model_result(result)
-        if fault:
-            self.fault_detected = True
-            self.state = 'waiting_for_disarm'
-            self._publish_status('fault_detected', {'result': result})
-            self.get_logger().warn('Fault detected; waiting for disarm before Inject.')
+        return self._interpret_model_result(result)
 
     def _build_snapshot(self) -> Dict[str, Any]:
         messages = self.latest_by_type
@@ -245,28 +275,25 @@ class FaultMonitorNode(Node):
             value = value.get(part)
         return value
 
-    def send_inject(self):
-        if self.inject_sent:
-            return
+    def send_inject(self, param: str, value: float, file_path: str):
         command = {
             'action': 'edit',
-            'file': self.config.inject.file,
-            'modifications': self.config.inject.modifications,
+            'file': file_path,
+            'modifications': {param: value},
         }
         msg = String()
         msg.data = json.dumps(command)
         self.inject_pub.publish(msg)
-        self.inject_sent = True
-        self._publish_status('inject_sent', {'command': command})
-        self.get_logger().info('Inject command sent.')
+        self.get_logger().info(f'Inject persisted {param}={value} in {file_path}')
 
-    def _publish_status(self, state: str, extra: Optional[dict] = None):
-        payload = {'state': state, 'timestamp': time.time()}
-        if extra:
-            payload.update(extra)
+    def set_params_live(self, params: Dict[str, float]):
+        command = {
+            'action': 'set_params',
+            'modifications': params,
+        }
         msg = String()
-        msg.data = json.dumps(payload)
-        self.status_pub.publish(msg)
+        msg.data = json.dumps(command)
+        self.inject_pub.publish(msg)
 
 
 def load_model(config: ModelConfig) -> Callable[[Dict[str, Any]], Any]:
@@ -291,31 +318,21 @@ def load_model(config: ModelConfig) -> Callable[[Dict[str, Any]], Any]:
     return func
 
 
-def start_services(config: ServiceConfig) -> Dict[str, subprocess.Popen]:
-    processes: Dict[str, subprocess.Popen] = {}
-    for svc in config.services:
-        cmd = build_service_cmd(svc, config)
-        if not cmd:
+def build_candidate_values(config: SearchConfig) -> Dict[str, List[float]]:
+    candidates: Dict[str, List[float]] = {}
+    for name, values in config.explicit_candidates.items():
+        candidates[name] = values
+
+    for name in config.bitmask_params:
+        if name in candidates:
             continue
-        try:
-            proc = subprocess.Popen(cmd)
-            processes[svc] = proc
-            print(f'[fault_demo] started {svc}: {" ".join(cmd)}')
-        except Exception as exc:
-            print(f'[fault_demo] failed to start {svc}: {exc}', file=sys.stderr)
-    return processes
-
-
-def stop_services(processes: Dict[str, subprocess.Popen]):
-    for svc, proc in list(processes.items()):
-        if proc.poll() is None:
-            try:
-                proc.send_signal(signal.SIGINT)
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        print(f'[fault_demo] stopped {svc} (rc={proc.poll()})')
-        processes.pop(svc, None)
+        base = config.baseline.get(name, 0.0)
+        base_int = int(round(base))
+        values: List[float] = []
+        for i in range(config.motor_count):
+            values.append(float(base_int ^ (1 << i)))
+        candidates[name] = values
+    return candidates
 
 
 def build_service_cmd(svc: str, config: ServiceConfig) -> Optional[List[str]]:
@@ -339,6 +356,7 @@ def build_service_cmd(svc: str, config: ServiceConfig) -> Optional[List[str]]:
             '--serial-baud', str(config.serial_baud),
             '--sitl-connection', config.sitl_connection,
             '--serial-port', config.serial_port,
+            '--no-tests',
         ]
         if config.connection:
             cmd.extend(['--connection', config.connection])
@@ -351,25 +369,102 @@ def build_service_cmd(svc: str, config: ServiceConfig) -> Optional[List[str]]:
     return None
 
 
-def monitor_until_fault(executor: SingleThreadedExecutor, node: FaultMonitorNode):
-    print('[fault_demo] monitoring telemetry while throttle is up')
-    while rclpy.ok() and not node.fault_detected:
+def start_services(config: ServiceConfig) -> Dict[str, subprocess.Popen]:
+    processes: Dict[str, subprocess.Popen] = {}
+    term_cmd = select_terminal(config) if config.launch_in_terminal else None
+    for svc in config.services:
+        cmd = build_service_cmd(svc, config)
+        if not cmd:
+            continue
+        try:
+            if term_cmd:
+                proc = subprocess.Popen(term_cmd(cmd))
+            else:
+                proc = subprocess.Popen(cmd)
+            processes[svc] = proc
+            print(f'[motor_finder] started {svc}: {" ".join(cmd)}')
+        except Exception as exc:
+            print(f'[motor_finder] failed to start {svc}: {exc}', file=sys.stderr)
+    return processes
+
+
+def select_terminal(config: ServiceConfig) -> Optional[Callable[[List[str]], List[str]]]:
+    for term in config.terminal_cmds:
+        if not shutil.which(term):
+            continue
+        if term == 'gnome-terminal':
+            return lambda cmd: [term, '--', 'bash', '-c', f'{" ".join(cmd)}; exec bash']
+        if term in ('x-terminal-emulator', 'konsole', 'xfce4-terminal', 'lxterminal'):
+            return lambda cmd: [term, '-e', 'bash', '-c', f'{" ".join(cmd)}; exec bash']
+    return None
+
+
+def stop_services(processes: Dict[str, subprocess.Popen]):
+    for svc, proc in list(processes.items()):
+        if proc.poll() is None:
+            try:
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        print(f'[motor_finder] stopped {svc} (rc={proc.poll()})')
+        processes.pop(svc, None)
+
+
+def select_candidates(config: SearchConfig) -> Dict[str, List[float]]:
+    candidates = build_candidate_values(config)
+    return {name: values for name, values in candidates.items() if values}
+
+
+def run_flight_once(config: FlightConfig):
+    if not config.enabled:
+        return None
+
+    async def _run():
+        from mavsdk import System
+        drone = System()
+        await drone.connect(system_address=config.system_address)
+        async for state in drone.core.connection_state():
+            if state.is_connected:
+                break
+        await drone.action.set_takeoff_altitude(config.takeoff_altitude)
+        await drone.action.arm()
+        await drone.action.takeoff()
+        await asyncio.sleep(config.hold_sec)
+        await drone.action.land()
+        await asyncio.sleep(config.land_wait_sec)
+
+    thread = threading.Thread(target=lambda: asyncio.run(_run()), daemon=True)
+    thread.start()
+    return thread
+
+
+def run_trial(executor: SingleThreadedExecutor, node: FinderNode, config: FinderConfig) -> Tuple[bool, int, int]:
+    node.reset_trial()
+    fault_votes = 0
+    total_votes = 0
+    start = time.time()
+
+    flight_thread = run_flight_once(config.flight)
+
+    while time.time() - start < config.test.duration_sec:
         executor.spin_once(timeout_sec=0.1)
         now = time.time()
         if node.should_classify(now):
-            node.classify_once()
+            result = node.classify_once()
+            if result is None:
+                continue
+            total_votes += 1
+            if result:
+                fault_votes += 1
+            if fault_votes >= config.model.required_fault_votes:
+                break
 
+    if flight_thread is not None:
+        flight_thread.join(timeout=config.test.duration_sec + 5.0)
 
-def wait_for_disarm(executor: SingleThreadedExecutor, node: FaultMonitorNode, timeout_sec: float):
-    print('[fault_demo] waiting for disarm')
-    start = time.time()
-    while rclpy.ok():
-        executor.spin_once(timeout_sec=0.1)
-        if node.armed is False:
-            return True
-        if timeout_sec > 0 and (time.time() - start) >= timeout_sec:
-            return False
-    return False
+    fault_detected = fault_votes >= config.model.required_fault_votes and total_votes >= config.model.min_votes
+    return fault_detected, fault_votes, total_votes
 
 
 def main():
@@ -377,29 +472,58 @@ def main():
     model = load_model(config.model)
 
     rclpy.init(args=None)
-    node = FaultMonitorNode(config, model)
+    node = FinderNode(config, model)
     executor = SingleThreadedExecutor()
     executor.add_node(node)
 
     processes: Dict[str, subprocess.Popen] = {}
+    found: Optional[Tuple[str, float]] = None
+
     try:
         if config.services.start_services:
             processes = start_services(config.services)
 
-        # High-level flow
-        monitor_until_fault(executor, node)
+        candidates = select_candidates(config.search)
+        if not candidates:
+            print('[motor_finder] no candidate params configured; aborting')
+            return
+        print(f'[motor_finder] candidate params: {list(candidates.keys())}')
 
-        if node.fault_detected:
-            if node.armed is False:
-                node.send_inject()
-            else:
-                ok = wait_for_disarm(executor, node, config.timeouts.disarm_timeout_sec)
-                if ok:
-                    node.send_inject()
-                else:
-                    print('[fault_demo] disarm timeout reached; no Inject sent')
+        if config.test.baseline_required_ok:
+            print('[motor_finder] running baseline trial...')
+            baseline_fault, votes_fault, votes_total = run_trial(executor, node, config)
+            if baseline_fault:
+                print(f'[motor_finder] baseline already shows fault ({votes_fault}/{votes_total}); aborting')
+                return
+
+        for name, values in candidates.items():
+            baseline = config.search.baseline.get(name, 0.0)
+            node.set_params_live({name: baseline})
+            time.sleep(config.search.settle_sec)
+            print(f'[motor_finder] testing {name} with values {values}')
+
+            for test_value in values:
+                node.set_params_live({name: test_value})
+                time.sleep(config.search.settle_sec)
+
+                fault, votes_fault, votes_total = run_trial(executor, node, config)
+                print(f'[motor_finder] {name}={test_value} -> fault={fault} votes={votes_fault}/{votes_total}')
+                if fault:
+                    found = (name, test_value)
+                    break
+
+            # restore baseline
+            node.set_params_live({name: baseline})
+
+            if found:
+                break
+
+        if found:
+            param, value = found
+            print(f'[motor_finder] FOUND candidate: {param}={value}')
+            node.send_inject(param, value, config.inject.file)
         else:
-            print('[fault_demo] exiting without fault detection')
+            print('[motor_finder] no candidate produced a fault')
     finally:
         if processes:
             stop_services(processes)

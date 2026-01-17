@@ -40,6 +40,7 @@ setup(
             'orchestra_service = waterfall.orchestra_service:main',
             'waterfall_coordinator = waterfall.coordinator:main',
             'waterfall_fault_demo = waterfall.fault_monitor_demo:main',
+            'waterfall_motor_finder = waterfall.motor_reverse_finder:main',
         ],
     },
 )

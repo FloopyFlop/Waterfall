@@ -30,6 +30,11 @@ class PX4ConfigInjector(Node):
     def __init__(self, cli_args=None):
         super().__init__('px4_config_injector')
 
+        # Ensure attributes exist even if we exit early
+        self.px4_api = None
+        self.mav = None
+        self.mavlink_conn_string = ''
+
         # Declare and get parameters
         self.declare_parameter('px4_build_path', '')
         self.declare_parameter('use_sitl', True)
@@ -38,28 +43,31 @@ class PX4ConfigInjector(Node):
         self.declare_parameter('serial_baud', 115200)
         # Leave empty by default so the SITL/hardware selection can take effect unless explicitly set
         self.declare_parameter('mavlink_connection', '')
+        self.declare_parameter('run_automated_tests', False)
 
         self._apply_cli_overrides(cli_args)
 
         self.px4_build_path = self.get_parameter('px4_build_path').get_parameter_value().string_value
+        if not self.px4_build_path:
+            self.px4_build_path = os.getenv('PX4_BUILD_PATH', '')
         self.use_sitl = bool(self.get_parameter('use_sitl').get_parameter_value().bool_value)
         self.serial_port = self.get_parameter('serial_port').get_parameter_value().string_value
         self.serial_baud = int(self.get_parameter('serial_baud').get_parameter_value().integer_value)
 
-        if not self.px4_build_path:
-            self.get_logger().error('PX4 build path not provided! Use --ros-args -p px4_build_path:=/path/to/px4')
-            sys.exit(1)
-
-        self.px4_build_path = Path(self.px4_build_path)
-
-        if not self.px4_build_path.exists():
-            self.get_logger().error(f'PX4 build path does not exist: {self.px4_build_path}')
-            sys.exit(1)
-
-        self.get_logger().info(f'PX4 Config Injector initialized with build path: {self.px4_build_path}')
+        if self.px4_build_path:
+            self.px4_build_path = Path(self.px4_build_path)
+            if not self.px4_build_path.exists():
+                self.get_logger().error(f'PX4 build path does not exist: {self.px4_build_path}')
+                sys.exit(1)
+            self.get_logger().info(f'PX4 Config Injector initialized with build path: {self.px4_build_path}')
+        else:
+            self.px4_build_path = None
+            self.get_logger().warning(
+                'PX4 build path not provided; file edits will be disabled. '
+                'Set PX4_BUILD_PATH or pass --px4-build-path to enable edit actions.'
+            )
 
         # Try to initialize PX4 C API (lowest level access)
-        self.px4_api = None
         if PX4_C_API_AVAILABLE:
             try:
                 self.get_logger().info('Attempting to load PX4 C API for direct parameter access...')
@@ -73,7 +81,6 @@ class PX4ConfigInjector(Node):
 
         # MAVLink connection as fallback
         self.mavlink_conn_string = self._resolve_mavlink_connection()
-        self.mav = None
 
         # Only try MAVLink if C API is not available
         if self.px4_api is None and MAVLINK_AVAILABLE:
@@ -109,11 +116,15 @@ class PX4ConfigInjector(Node):
         self.get_logger().info('Node ready. Listening for injection commands on /px4_injector/command')
 
         # Identify config file locations
-        self.identify_config_files()
+        if self.px4_build_path is not None:
+            self.identify_config_files()
 
-        # Run automated tests after a short delay
-        self.get_logger().info('Scheduling automated parameter tests to run in 2 seconds...')
-        self.test_timer = self.create_timer(2.0, self.run_automated_tests)
+        # Run automated tests only if explicitly enabled
+        if self.get_parameter('run_automated_tests').get_parameter_value().bool_value:
+            self.get_logger().info('Scheduling automated parameter tests to run in 2 seconds...')
+            self.test_timer = self.create_timer(2.0, self.run_automated_tests)
+        else:
+            self.test_timer = None
 
     def _apply_cli_overrides(self, cli_args):
         """Allow simple --sitl/--connection flag usage without long ROS args."""
@@ -133,9 +144,13 @@ class PX4ConfigInjector(Node):
             updates.append(Parameter('serial_baud', Parameter.Type.INTEGER, cli_args.serial_baud))
         if getattr(cli_args, 'connection', None):
             updates.append(Parameter('mavlink_connection', Parameter.Type.STRING, cli_args.connection))
+        if getattr(cli_args, 'run_tests', None) is True:
+            updates.append(Parameter('run_automated_tests', Parameter.Type.BOOL, True))
+        if getattr(cli_args, 'run_tests', None) is False:
+            updates.append(Parameter('run_automated_tests', Parameter.Type.BOOL, False))
 
         if updates:
-            self.set_parameters(updates)
+            super().set_parameters(updates)
 
     def _resolve_mavlink_connection(self):
         explicit = self.get_parameter('mavlink_connection').get_parameter_value().string_value
@@ -149,6 +164,30 @@ class PX4ConfigInjector(Node):
 
         # Hardware path – let mavutil use the baud declared via parameter
         return self.serial_port
+
+    def _ensure_mavlink(self):
+        """Attempt to connect to MAVLink if not connected yet."""
+        if self.mav is not None or not MAVLINK_AVAILABLE:
+            return
+        if not self.mavlink_conn_string:
+            self.mavlink_conn_string = self._resolve_mavlink_connection()
+        if not self.mavlink_conn_string:
+            self.get_logger().warning('No MAVLink connection string available; cannot connect.')
+            return
+        try:
+            self.get_logger().info(f'Connecting to MAVLink at {self.mavlink_conn_string}')
+            conn_kwargs = {}
+            if not self.use_sitl and self.serial_baud:
+                conn_kwargs['baud'] = self.serial_baud
+            self.mav = mavutil.mavlink_connection(self.mavlink_conn_string, **conn_kwargs)
+            self.get_logger().info('Waiting for MAVLink heartbeat...')
+            self.mav.wait_heartbeat(timeout=5)
+            self.get_logger().info(
+                f'MAVLink connected! System {self.mav.target_system} Component {self.mav.target_component}'
+            )
+        except Exception as exc:
+            self.get_logger().warning(f'MAVLink reconnect failed: {exc}')
+            self.mav = None
 
     def identify_config_files(self):
         """Identify common PX4 configuration file locations"""
@@ -179,11 +218,15 @@ class PX4ConfigInjector(Node):
 
     def run_automated_tests(self):
         """Run automated parameter tests (hardcoded in code)"""
+        if getattr(self, 'px4_api', None) is None and self.mav is None:
+            self.get_logger().warning('No parameter access method available; skipping automated tests.')
+            return
         self.test_timer.cancel()  # Run only once
 
+        px4_api = getattr(self, 'px4_api', None)
         self.get_logger().info('='*80)
         self.get_logger().info('STARTING AUTOMATED PARAMETER TEST SUITE')
-        self.get_logger().info(f'Using: {"PX4 C API (Direct)" if self.px4_api else "MAVLink Protocol"}')
+        self.get_logger().info(f'Using: {"PX4 C API (Direct)" if px4_api else "MAVLink Protocol"}')
         self.get_logger().info('='*80)
 
         # Test 1: Disable Preflight Checks
@@ -192,7 +235,7 @@ class PX4ConfigInjector(Node):
 
         # First set INT32 parameters
         self.get_logger().info('Setting INT32 circuit breakers...')
-        self.set_parameters_int32({
+        self.set_px4_parameters_int32({
             'CBRK_SUPPLY_CHK': 894281,    # Disable power supply check
             'CBRK_USB_CHK': 197848,       # Disable USB check
             'CBRK_IO_SAFETY': 22027,      # Disable IO safety
@@ -201,7 +244,7 @@ class PX4ConfigInjector(Node):
 
         # Then set FLOAT parameters
         self.get_logger().info('Setting FLOAT arming checks...')
-        self.set_parameters({
+        self.set_px4_parameters({
             'COM_ARM_IMU_ACC': 1000.0,    # Disable accel consistency check
             'COM_ARM_IMU_GYR': 1000.0,    # Disable gyro consistency check
             'COM_DISARM_PRFLT': -1.0,     # Disable preflight auto-disarm
@@ -225,7 +268,7 @@ class PX4ConfigInjector(Node):
         # Test 2: INVERTED CONTROLS - Roll responds backwards
         self.get_logger().info('')
         self.get_logger().info('--- Test 2: SABOTAGE - INVERT ROLL CONTROL (WILL FLIP!) ---')
-        self.set_parameters({
+        self.set_px4_parameters({
             'MC_ROLL_P': -7.0,           # NEGATIVE = INVERTED!
             'MC_ROLLRATE_P': -0.15,      # NEGATIVE = INVERTED!
         })
@@ -234,7 +277,7 @@ class PX4ConfigInjector(Node):
         # Test 3: INVERTED PITCH CONTROL
         self.get_logger().info('')
         self.get_logger().info('--- Test 3: SABOTAGE - INVERT PITCH CONTROL (WILL FLIP!) ---')
-        self.set_parameters({
+        self.set_px4_parameters({
             'MC_PITCH_P': -7.0,          # NEGATIVE = INVERTED!
             'MC_PITCHRATE_P': -0.15,     # NEGATIVE = INVERTED!
         })
@@ -243,7 +286,7 @@ class PX4ConfigInjector(Node):
         # Test 4: EXTREME OSCILLATION - Massive I gain, zero D
         self.get_logger().info('')
         self.get_logger().info('--- Test 4: SABOTAGE - EXTREME OSCILLATION (WILL SHAKE VIOLENTLY!) ---')
-        self.set_parameters({
+        self.set_px4_parameters({
             'MC_ROLLRATE_I': 5.0,        # 25x normal! Massive windup
             'MC_PITCHRATE_I': 5.0,       # 25x normal! Massive windup
             'MC_ROLLRATE_D': 0.0,        # No damping
@@ -254,7 +297,7 @@ class PX4ConfigInjector(Node):
         # Test 5: ZERO ALTITUDE CONTROL - Drone will drop
         self.get_logger().info('')
         self.get_logger().info('--- Test 5: SABOTAGE - DISABLE ALTITUDE CONTROL (WILL DROP!) ---')
-        self.set_parameters({
+        self.set_px4_parameters({
             'MPC_Z_P': 0.0,              # No altitude control!
             'MPC_Z_VEL_P_ACC': 0.0,      # No vertical velocity control!
             'MPC_THR_HOVER': 0.3,        # Low hover throttle = drop
@@ -264,7 +307,7 @@ class PX4ConfigInjector(Node):
         # Test 6: INVERTED YAW + MAX RATE
         self.get_logger().info('')
         self.get_logger().info('--- Test 6: SABOTAGE - INVERTED YAW (WILL SPIN!) ---')
-        self.set_parameters({
+        self.set_px4_parameters({
             'MC_YAWRATE_P': -0.2,        # NEGATIVE = INVERTED!
             'MC_YAW_P': -2.8,            # NEGATIVE = INVERTED!
             'MC_YAWRATE_MAX': 400.0,     # 2x normal max rate = FAST SPIN
@@ -326,56 +369,96 @@ class PX4ConfigInjector(Node):
                     import traceback
                     self.get_logger().error(f'Traceback: {traceback.format_exc()}')
 
-        elif self.mav:
-            # Fallback to MAVLink
-            self.get_logger().info('Reading parameters via MAVLink...')
-            for param_name in param_names:
-                try:
-                    self.get_logger().info(f'Reading parameter: {param_name}')
-
-                    # Request parameter
-                    self.mav.mav.param_request_read_send(
-                        self.mav.target_system,
-                        self.mav.target_component,
-                        param_name.encode('utf-8'),
-                        -1
-                    )
-
-                    # Wait for response - keep reading until we get the right parameter
-                    start_time = time.time()
-                    timeout = 2.0
-                    found = False
-
-                    while (time.time() - start_time) < timeout:
-                        msg = self.mav.recv_match(type='PARAM_VALUE', blocking=True, timeout=0.5)
-                        if msg:
-                            # Handle both bytes and str for param_id (different pymavlink versions)
-                            param_id = msg.param_id
-                            if isinstance(param_id, bytes):
-                                param_id = param_id.decode('utf-8').rstrip('\x00')
-                            elif isinstance(param_id, str):
-                                param_id = param_id.rstrip('\x00')
-
-                            # Check if this is the parameter we requested
-                            if param_id == param_name:
-                                param_value = msg.param_value
-                                self.get_logger().info(f'  CURRENT VALUE: {param_id} = {param_value}')
-                                self.get_logger().info(f'  Type: {msg.param_type}, Index: {msg.param_index}/{msg.param_count}')
-                                found = True
-                                break
-                            else:
-                                self.get_logger().debug(f'  Skipping unexpected param: {param_id} (waiting for {param_name})')
-
-                    if not found:
-                        self.get_logger().warning(f'  No response for parameter {param_name}')
-
-                except Exception as e:
-                    self.get_logger().error(f'Failed to read parameter {param_name}: {e}')
         else:
-            self.get_logger().error('No parameter access method available (neither C API nor MAVLink)')
+            if self.mav is None:
+                self._ensure_mavlink()
 
-    def set_parameters_int32(self, params):
-        """Set INT32 parameters via MAVLink"""
+            if self.mav:
+                # Fallback to MAVLink
+                self.get_logger().info('Reading parameters via MAVLink...')
+                for param_name in param_names:
+                    try:
+                        self.get_logger().info(f'Reading parameter: {param_name}')
+
+                        # Request parameter
+                        self.mav.mav.param_request_read_send(
+                            self.mav.target_system,
+                            self.mav.target_component,
+                            param_name.encode('utf-8'),
+                            -1
+                        )
+
+                        # Wait for response - keep reading until we get the right parameter
+                        start_time = time.time()
+                        timeout = 2.0
+                        found = False
+
+                        while (time.time() - start_time) < timeout:
+                            msg = self.mav.recv_match(type='PARAM_VALUE', blocking=True, timeout=0.5)
+                            if msg:
+                                # Handle both bytes and str for param_id (different pymavlink versions)
+                                param_id = msg.param_id
+                                if isinstance(param_id, bytes):
+                                    param_id = param_id.decode('utf-8').rstrip('\x00')
+                                elif isinstance(param_id, str):
+                                    param_id = param_id.rstrip('\x00')
+
+                                # Check if this is the parameter we requested
+                                if param_id == param_name:
+                                    param_value = msg.param_value
+                                    self.get_logger().info(f'  CURRENT VALUE: {param_id} = {param_value}')
+                                    self.get_logger().info(
+                                        f'  Type: {msg.param_type}, Index: {msg.param_index}/{msg.param_count}'
+                                    )
+                                    found = True
+                                    break
+                                else:
+                                    self.get_logger().debug(
+                                        f'  Skipping unexpected param: {param_id} (waiting for {param_name})'
+                                    )
+
+                        if not found:
+                            self.get_logger().warning(f'  No response for parameter {param_name}')
+
+                    except Exception as e:
+                        self.get_logger().error(f'Failed to read parameter {param_name}: {e}')
+            else:
+                self.get_logger().warning('No parameter access method available (neither C API nor MAVLink)')
+
+    def set_px4_parameters_int32(self, params):
+        """Set INT32 parameters via C API (preferred) or MAVLink."""
+        if not params:
+            return
+
+        if self.px4_api:
+            self.get_logger().info('Setting INT32 parameters via PX4 C API (Direct)...')
+            for param_name, value in params.items():
+                try:
+                    param_value = int(value)
+                    self.get_logger().info(f'Setting INT32 parameter: {param_name} = {param_value}')
+                    self.get_logger().info(f'  C API call: px4_api.set_param_int32("{param_name}", {param_value})')
+
+                    success = self.px4_api.set_param_int32(param_name, param_value)
+                    if success:
+                        self.get_logger().info('  SUCCESS: C API confirmed parameter set')
+                        read_value = self.px4_api.get_param_int32(param_name)
+                        if read_value is not None:
+                            self.get_logger().info(f'  VERIFIED: Read back value = {read_value}')
+                            if read_value != param_value:
+                                self.get_logger().warning(
+                                    f'  WARNING: Set value {param_value} differs from read {read_value}'
+                                )
+                        else:
+                            self.get_logger().warning('  Could not read back parameter')
+                    else:
+                        self.get_logger().error('  FAILED: C API returned error')
+                except Exception as e:
+                    self.get_logger().error(f'Failed to set INT32 parameter {param_name}: {e}')
+                    import traceback
+                    self.get_logger().error(f'Traceback: {traceback.format_exc()}')
+            return
+
+        self._ensure_mavlink()
         if self.mav:
             self.get_logger().info('Setting INT32 parameters via MAVLink...')
             for param_name, value in params.items():
@@ -416,11 +499,15 @@ class PX4ConfigInjector(Node):
                                 self.get_logger().info(f'  SUCCESS: {param_id} confirmed at {new_value}')
 
                                 if new_value != param_value:
-                                    self.get_logger().warning(f'  WARNING: Set value {param_value} differs from confirmed {new_value}')
+                                    self.get_logger().warning(
+                                        f'  WARNING: Set value {param_value} differs from confirmed {new_value}'
+                                    )
                                 found = True
                                 break
                             else:
-                                self.get_logger().debug(f'  Skipping unexpected param: {param_id} (waiting for {param_name})')
+                                self.get_logger().debug(
+                                    f'  Skipping unexpected param: {param_id} (waiting for {param_name})'
+                                )
 
                     if not found:
                         self.get_logger().warning(f'  No acknowledgment received for {param_name}')
@@ -430,10 +517,13 @@ class PX4ConfigInjector(Node):
                     import traceback
                     self.get_logger().error(f'Traceback: {traceback.format_exc()}')
         else:
-            self.get_logger().error('MAVLink not available for INT32 parameter setting')
+            self.get_logger().warning('No parameter access method available (neither C API nor MAVLink)')
 
-    def set_parameters(self, params):
+    def set_px4_parameters(self, params):
         """Set parameters and verify they were set"""
+        if not params:
+            return
+
         if self.px4_api:
             # Use direct C API
             self.get_logger().info('Setting parameters via PX4 C API (Direct)...')
@@ -465,7 +555,10 @@ class PX4ConfigInjector(Node):
                     import traceback
                     self.get_logger().error(f'Traceback: {traceback.format_exc()}')
 
-        elif self.mav:
+            return
+
+        self._ensure_mavlink()
+        if self.mav:
             # Fallback to MAVLink
             self.get_logger().info('Setting parameters via MAVLink...')
             for param_name, value in params.items():
@@ -520,7 +613,7 @@ class PX4ConfigInjector(Node):
                     import traceback
                     self.get_logger().error(f'Traceback: {traceback.format_exc()}')
         else:
-            self.get_logger().error('No parameter access method available (neither C API nor MAVLink)')
+            self.get_logger().warning('No parameter access method available (neither C API nor MAVLink)')
 
     def command_callback(self, msg):
         """Handle incoming injection commands"""
@@ -536,6 +629,17 @@ class PX4ConfigInjector(Node):
                 file_path = command.get('file')
                 modifications = command.get('modifications', {})
                 self.edit_config(file_path, modifications)
+            elif action == 'set_params':
+                modifications = command.get('modifications', {})
+                self.set_params_live(modifications)
+            elif action == 'inject':
+                param = command.get('param')
+                value = command.get('value')
+                file_path = command.get('file')
+                if param is None or value is None or file_path is None:
+                    self.get_logger().warning('inject action requires param, value, and file fields.')
+                else:
+                    self.edit_config(file_path, {param: value})
             elif action == 'restore':
                 self.restore_configs()
             else:
@@ -563,6 +667,10 @@ class PX4ConfigInjector(Node):
         self.get_logger().info(f'Editing config file: {file_path}')
         self.get_logger().info(f'Modifications: {modifications}')
 
+        if self.px4_build_path is None:
+            self.get_logger().error('PX4 build path not configured; cannot edit config files.')
+            return
+
         target_file = self.px4_build_path / file_path
 
         if not target_file.exists():
@@ -588,6 +696,9 @@ class PX4ConfigInjector(Node):
                 modified_content += f"param set {param} {value}\n"
 
                 # Also try to set parameter live via MAVLink
+                if self.mav is None:
+                    self._ensure_mavlink()
+
                 if self.mav:
                     try:
                         # Convert value to appropriate type
@@ -601,8 +712,19 @@ class PX4ConfigInjector(Node):
                         else:
                             param_value = float(value)
 
+                        if param_value.is_integer():
+                            mav_type = mavutil.mavlink.MAV_PARAM_TYPE_INT32
+                        else:
+                            mav_type = mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+
                         self.get_logger().info(f'Setting live parameter: {param} = {param_value}')
-                        self.mav.param_set_send(param, param_value)
+                        self.mav.mav.param_set_send(
+                            self.mav.target_system,
+                            self.mav.target_component,
+                            param.encode('utf-8'),
+                            float(param_value),
+                            mav_type,
+                        )
                         params_set.append(param)
 
                     except Exception as e:
@@ -646,7 +768,46 @@ class PX4ConfigInjector(Node):
 
         self.get_logger().info('Configuration restored')
 
-def periodic_check(self):
+    def set_params_live(self, modifications):
+        """Set parameters live via MAVLink or C API without editing config files."""
+        if not modifications:
+            return
+
+        if self.px4_api:
+            cleaned = {}
+            for param, value in modifications.items():
+                try:
+                    if isinstance(value, str):
+                        value = value.strip()
+                    cleaned[param] = float(value)
+                except (TypeError, ValueError):
+                    self.get_logger().warning(f'Skipping non-numeric param {param}={value}')
+            if cleaned:
+                self.set_px4_parameters(cleaned)
+            return
+
+        int_params = {}
+        float_params = {}
+        for param, value in modifications.items():
+            try:
+                if isinstance(value, str):
+                    value = value.strip()
+                float_val = float(value)
+            except (TypeError, ValueError):
+                self.get_logger().warning(f'Skipping non-numeric param {param}={value}')
+                continue
+
+            if float_val.is_integer():
+                int_params[param] = int(float_val)
+            else:
+                float_params[param] = float_val
+
+        if int_params:
+            self.set_px4_parameters_int32(int_params)
+        if float_params:
+            self.set_px4_parameters(float_params)
+
+    def periodic_check(self):
         """Periodic health check"""
         status_msg = String()
         status_msg.data = json.dumps({
@@ -668,6 +829,9 @@ def _parse_cli_args(argv):
     parser.add_argument('--sitl-connection', dest='sitl_connection', help='SITL MAVLink connection string override.')
     parser.add_argument('--serial-port', dest='serial_port', help='Serial port for hardware connection.')
     parser.add_argument('--serial-baud', dest='serial_baud', type=int, help='Serial baud rate for hardware connection.')
+    parser.add_argument('--run-tests', dest='run_tests', action='store_true', help='Run automated sabotage tests.')
+    parser.add_argument('--no-tests', dest='run_tests', action='store_false', help='Disable automated sabotage tests.')
+    parser.set_defaults(run_tests=None)
     return parser.parse_known_args(argv)
 
 

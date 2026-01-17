@@ -24,6 +24,14 @@ $PYTHON -m colcon build --symlink-install --packages-select waterfall
 source install/setup.bash
 ```
 
+## C API bridge (optional)
+If you want Inject to use the direct PX4 C API (instead of MAVLink), build the bridge and export the library path:
+```bash
+./build_bridge.sh /path/to/PX4-Autopilot
+export PX4_PARAM_BRIDGE_LIB=$PWD/waterfall/build/libpx4_param_bridge.so
+```
+Note: this only works when PX4 exports `param_*` symbols (for example, SITL built with exported symbols or when the bridge is loaded into the PX4 process).
+
 ## Run examples
 - Start Firehose + UniformPump in SITL:
   ```bash
@@ -63,6 +71,11 @@ source install/setup.bash
   ros2 run waterfall waterfall_fault_demo
   ```
   Configuration is declarative inside `waterfall/fault_monitor_demo.py` (edit the `CONFIG` block and/or `example_model`).
+- Motor reverse finder (auto-searches for the param that flips a motor direction):
+  ```bash
+  ros2 run waterfall waterfall_motor_finder
+  ```
+  Configuration is declarative inside `waterfall/motor_reverse_finder.py` (edit the `CONFIG` block, especially `search.baseline` and `search.explicit_candidates`). You can also export `PX4_BUILD_PATH` to point at the PX4 build directory before running.
 
 ## Key flags
 - `--sitl` switches all MAVLink/MAVSDK clients to the configured SITL endpoints (`--sitl-connection` for Firehose/Inject, `--orchestra-sitl` for Orchestra).

@@ -59,7 +59,10 @@ class PX4ParamAPI:
         print(f"Loading PX4 parameter bridge library: {library_path}")
 
         try:
-            self.lib = ctypes.CDLL(str(library_path))
+            if hasattr(ctypes, 'RTLD_GLOBAL'):
+                self.lib = ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
+            else:
+                self.lib = ctypes.CDLL(str(library_path))
             print("Successfully loaded PX4 parameter bridge library")
         except Exception as e:
             raise RuntimeError(f"Failed to load library {library_path}: {e}")
@@ -112,6 +115,16 @@ class PX4ParamAPI:
         # px4_param_get_type(const char *name) -> int
         self.lib.px4_param_get_type.argtypes = [ctypes.c_char_p]
         self.lib.px4_param_get_type.restype = ctypes.c_int
+
+        if hasattr(self.lib, 'px4_param_bridge_ready'):
+            self.lib.px4_param_bridge_ready.argtypes = []
+            self.lib.px4_param_bridge_ready.restype = ctypes.c_int
+            if self.lib.px4_param_bridge_ready() != 1:
+                raise RuntimeError(
+                    "PX4 param bridge loaded but PX4 symbols not available. "
+                    "Ensure the bridge is loaded into the PX4 process (LD_PRELOAD) "
+                    "or rebuild PX4 with exported param symbols."
+                )
 
         print("Function signatures configured")
 

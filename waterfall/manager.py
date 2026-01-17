@@ -229,7 +229,8 @@ def _parse_args(argv: List[str]) -> Tuple[argparse.Namespace, List[str]]:
 
     parser.add_argument('--orchestra-connection', default=None,
                         help='Explicit MAVSDK connection string for Orchestra')
-    parser.add_argument('--orchestra-sitl', default='udp://:14540', help='SITL MAVSDK endpoint for Orchestra')
+    parser.add_argument('--orchestra-sitl', default='udpin://0.0.0.0:14540',
+                        help='SITL MAVSDK endpoint for Orchestra')
     parser.add_argument('--orchestra-hardware', default='serial:///dev/ttyACM0:57600',
                         help='Hardware MAVSDK endpoint for Orchestra when not using SITL')
 
