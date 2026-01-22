@@ -72,3 +72,30 @@ source install/setup.bash
 - Extra args to pass through to underlying nodes: `--firehose-args`, `--pump-args`, `--inject-args`, `--orchestra-args`.
 
 The node publishes basic lifecycle status on `waterfall/status` for monitoring.
+
+## PWM_MAIN_FUNC4 Demo Script
+
+A focused demo script for modifying the `PWM_MAIN_FUNC4` parameter specifically:
+
+```bash
+# Basic demo with default value (1)
+python3 pwm_func4_demo.py --px4-build-path /path/to/PX4-Autopilot/build/px4_sitl_default
+
+# Set specific value (e.g., 3 for servo output)  
+python3 pwm_func4_demo.py --px4-build-path /path/to/px4 --target-value 3
+
+# Use SITL connection
+python3 pwm_func4_demo.py --px4-build-path /path/to/px4 --sitl --target-value 2
+
+# Hardware connection
+python3 pwm_func4_demo.py --px4-build-path /path/to/px4 \
+  --serial-port /dev/ttyTHS3 --serial-baud 115200 --target-value 4
+```
+
+This script:
+- Focuses only on the `PWM_MAIN_FUNC4` parameter (PWM Main 4 output function)
+- Reads current value, sets new value, and verifies the change
+- Supports both PX4 C API and MAVLink connections
+- Minimal implementation without the complex automated tests from the full inject service
+
+**Note:** Modifying PWM function parameters can affect vehicle behavior. Ensure you understand the parameter's impact before making changes.
